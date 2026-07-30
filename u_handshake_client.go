@@ -13,9 +13,9 @@ import (
 	"io"
 
 	"github.com/andybalholm/brotli"
-	"github.com/bogdanfinn/utls/internal/fips140tls"
-	"github.com/bogdanfinn/utls/internal/hpke"
-	"github.com/bogdanfinn/utls/internal/tls13"
+	"github.com/yogesh-prabu/utls/internal/fips140tls"
+	"github.com/yogesh-prabu/utls/internal/hpke"
+	"github.com/yogesh-prabu/utls/internal/tls13"
 	"github.com/klauspost/compress/zstd"
 )
 
