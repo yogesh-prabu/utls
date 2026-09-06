@@ -611,7 +611,7 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 		// 2. Fallback to the legacy single field.
 		clientKey = hs.keyShareKeys.ecdhe
 	}
-	
+
 	// 3. Last resort fallback for MLKEM if map wasn't populated for it
 	if clientKey == nil && (selectedGroup == X25519MLKEM768 || selectedGroup == X25519Kyber768Draft00) {
 		clientKey = hs.keyShareKeys.mlkemEcdhe
@@ -871,7 +871,11 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 	}
 
 	// See RFC 8446, Section 4.4.3.
-	if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms()) {
+	// ML-DSA schemes are accepted even though they are not part of the static
+	// default set: a (parrot) ClientHello can advertise them, so a server may
+	// legitimately select one here. The signature itself is verified below.
+	if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms()) &&
+		!isMLDSASignatureScheme(certVerify.signatureAlgorithm) {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: certificate used with invalid signature algorithm")
 	}
