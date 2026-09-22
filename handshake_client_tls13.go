@@ -398,7 +398,7 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 			for _, ext := range hs.uconn.Extensions {
 				// new ks seems to be generated either way
 				if ks, ok := ext.(*KeyShareExtension); ok {
-					ks.KeyShares = keyShares(hs.hello.keyShares).ToPublic()
+					ks.KeyShares = keyShares(hello.keyShares).ToPublic()
 					keyShareExtFound = true
 				}
 			}
@@ -536,12 +536,16 @@ func (hs *clientHandshakeStateTLS13) processServerHello() error {
 		return nil
 	}
 
-	if int(hs.serverHello.selectedIdentity) >= len(hs.hello.pskIdentities) {
+	helloIdentities := hs.hello.pskIdentities
+	if hs.echContext != nil && hs.echContext.innerHello != nil && len(hs.echContext.innerHello.pskIdentities) > 0 {
+		helloIdentities = hs.echContext.innerHello.pskIdentities
+	}
+	if int(hs.serverHello.selectedIdentity) >= len(helloIdentities) {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: server selected an invalid PSK")
 	}
 
-	if len(hs.hello.pskIdentities) != 1 || hs.session == nil {
+	if len(helloIdentities) != 1 || hs.session == nil {
 		return c.sendAlert(alertInternalError)
 	}
 	pskSuite := cipherSuiteTLS13ByID(hs.session.cipherSuite)

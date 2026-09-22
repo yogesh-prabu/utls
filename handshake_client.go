@@ -1140,7 +1140,7 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 	}
 
 	echRejected := c.config.EncryptedClientHelloConfigList != nil && !c.echAccepted
-	if echRejected {
+	if echRejected && !c.config.InsecureSkipVerify {
 		if c.config.EncryptedClientHelloRejectionVerify != nil {
 			if err := c.config.EncryptedClientHelloRejectionVerify(c.connectionStateLocked()); err != nil {
 				c.sendAlert(alertBadCertificate)

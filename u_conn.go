@@ -169,7 +169,8 @@ func (uconn *UConn) uLoadSession() error {
 	if cfg := uconn.config; cfg.SessionTicketsDisabled || cfg.ClientSessionCache == nil {
 		return nil
 	}
-	switch uconn.sessionController.shouldLoadSession() {
+	st := uconn.sessionController.shouldLoadSession()
+	switch st {
 	case shouldReturn:
 	case shouldSetTicket:
 		uconn.sessionController.setSessionTicketToUConn()
@@ -195,6 +196,12 @@ func (uconn *UConn) uLoadSession() error {
 }
 
 func (uconn *UConn) uApplyPatch() {
+	if len(uconn.config.EncryptedClientHelloConfigList) > 0 {
+		if uconn.sessionController.shouldUpdateBinders() {
+			uconn.sessionController.setPskToUConn()
+		}
+		return
+	}
 	helloLen := len(uconn.HandshakeState.Hello.Raw)
 	if uconn.sessionController.shouldUpdateBinders() {
 		uconn.sessionController.updateBinders()
@@ -507,11 +514,55 @@ func (uconn *UConn) extensionsList() []uint16 {
 }
 
 func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech *echClientContext, useKey bool) error {
-	// This function is mostly copied from
-	// https://github.com/refraction-networking/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L408
 	var encapKey []byte
 	if useKey {
 		encapKey = ech.encapsulatedKey
+	}
+
+	var pskCommon *PreSharedKeyCommon
+	var cipherSuite *cipherSuiteTLS13
+	if uconn.sessionController != nil && uconn.sessionController.pskExtension != nil {
+		c := uconn.sessionController.pskExtension.GetPreSharedKeyCommon()
+		pskCommon = &c
+		if pskCommon.Session != nil {
+			cipherSuite = cipherSuiteTLS13ByID(pskCommon.Session.cipherSuite)
+			if cipherSuite != nil {
+				inner.pskIdentities = make([]pskIdentity, len(pskCommon.Identities))
+				for i, id := range pskCommon.Identities {
+					inner.pskIdentities[i] = pskIdentity{
+						label:               id.Label,
+						obfuscatedTicketAge: id.ObfuscatedTicketAge,
+					}
+				}
+				inner.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
+			}
+		}
+	}
+
+	// Outer ClientHello MUST NOT offer PSKs for the backend server (RFC 9849)
+	if pskExtIdx := slices.IndexFunc(uconn.Extensions, func(ext TLSExtension) bool {
+		_, ok := ext.(PreSharedKeyExtension)
+		return ok
+	}); pskExtIdx >= 0 {
+		uconn.Extensions = slices.Delete(uconn.Extensions, pskExtIdx, pskExtIdx+1)
+	}
+
+	echExtIdx := slices.IndexFunc(uconn.Extensions, func(ext TLSExtension) bool {
+		_, ok := ext.(EncryptedClientHelloExtension)
+		return ok
+	})
+	if echExtIdx < 0 {
+		return fmt.Errorf("extension satisfying EncryptedClientHelloExtension not present")
+	}
+	oldExt := uconn.Extensions[echExtIdx]
+
+	// Mirror inner key shares to outer KeyShareExtension so compressed extensions decompress accurately
+	if len(inner.keyShares) > 0 {
+		for _, ext := range uconn.Extensions {
+			if ks, ok := ext.(*KeyShareExtension); ok {
+				ks.KeyShares = keyShares(inner.keyShares).ToPublic()
+			}
+		}
 	}
 
 	encodedInner, err := encodeInnerClientHelloReorderOuterExts(inner, int(ech.config.MaxNameLength), uconn.extensionsList())
@@ -525,15 +576,6 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 		return err
 	}
 
-	echExtIdx := slices.IndexFunc(uconn.Extensions, func(ext TLSExtension) bool {
-		_, ok := ext.(EncryptedClientHelloExtension)
-		return ok
-	})
-	if echExtIdx < 0 {
-		return fmt.Errorf("extension satisfying EncryptedClientHelloExtension not present")
-	}
-	oldExt := uconn.Extensions[echExtIdx]
-
 	uconn.Extensions[echExtIdx] = &GenericExtension{
 		Id:   extensionEncryptedClientHello,
 		Data: outerECHExt,
@@ -541,6 +583,30 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 
 	if err := uconn.MarshalClientHelloNoECH(); err != nil {
 		return err
+	}
+
+	if pskCommon != nil && cipherSuite != nil {
+		outerMsg := &clientHelloMsg{
+			original:  uconn.HandshakeState.Hello.Raw,
+			sessionId: uconn.HandshakeState.Hello.SessionId,
+		}
+		reconInner, err := decodeInnerClientHello(outerMsg, encodedInner)
+		if err != nil {
+			return fmt.Errorf("decodeInnerClientHello failed: %w", err)
+		}
+		reconBytesWithoutBinders, err := reconInner.marshalWithoutBinders()
+		if err != nil {
+			return fmt.Errorf("marshalWithoutBinders failed: %w", err)
+		}
+		transcript := cipherSuite.hash.New()
+		transcript.Write(reconBytesWithoutBinders)
+		binder := cipherSuite.finishedHash(pskCommon.BinderKey, transcript)
+		inner.pskBinders = [][]byte{binder}
+
+		encodedInner, err = encodeInnerClientHelloReorderOuterExts(inner, int(ech.config.MaxNameLength), uconn.extensionsList())
+		if err != nil {
+			return err
+		}
 	}
 
 	serializedOuter := uconn.HandshakeState.Hello.Raw
@@ -562,6 +628,17 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 		return err
 	}
 
+	if len(inner.pskIdentities) > 0 {
+		uconn.HandshakeState.Hello.PskIdentities = make([]PskIdentity, len(inner.pskIdentities))
+		for i, id := range inner.pskIdentities {
+			uconn.HandshakeState.Hello.PskIdentities[i] = PskIdentity{
+				Label:               id.label,
+				ObfuscatedTicketAge: id.obfuscatedTicketAge,
+			}
+		}
+		uconn.HandshakeState.Hello.PskBinders = inner.pskBinders
+	}
+
 	uconn.Extensions[echExtIdx] = oldExt
 	return nil
 
@@ -575,14 +652,24 @@ func (uconn *UConn) MarshalClientHello() error {
 		}
 
 		// copy compressed extensions to the ClientHelloInner
+		inner.cipherSuites = uconn.HandshakeState.Hello.CipherSuites
+		inner.supportedCurves = uconn.HandshakeState.Hello.SupportedCurves
+		inner.alpnProtocols = uconn.HandshakeState.Hello.AlpnProtocols
 		inner.keyShares = KeyShares(uconn.HandshakeState.Hello.KeyShares).ToPrivate()
 		inner.supportedSignatureAlgorithms = uconn.HandshakeState.Hello.SupportedSignatureAlgorithms
 		inner.sessionId = uconn.HandshakeState.Hello.SessionId
-		inner.supportedCurves = uconn.HandshakeState.Hello.SupportedCurves
+		inner.supportedVersions = []uint16{VersionTLS13}
+		// Always advertise pskModes in ClientHelloInner so server sends NewSessionTicket
+		inner.pskModes = []uint8{pskModeDHE}
+		if len(uconn.HandshakeState.Hello.PskModes) > 0 {
+			inner.pskModes = slices.Clone(uconn.HandshakeState.Hello.PskModes)
+		}
 
 		ech.innerHello = inner
 
-		uconn.computeAndUpdateOuterECHExtension(inner, ech, true)
+		if err := uconn.computeAndUpdateOuterECHExtension(inner, ech, true); err != nil {
+			return err
+		}
 
 		uconn.echCtx = ech
 		return nil
