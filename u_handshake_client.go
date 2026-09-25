@@ -384,6 +384,9 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	// [uTLS section begins]
 	hello := c.HandshakeState.Hello.getPrivatePtr()
 	ech := c.echCtx
+	if ech != nil && ech.config != nil {
+		c.Conn.echPublicName = string(ech.config.PublicName)
+	}
 	defer func() { c.HandshakeState.Hello = hello.getPublicPtr() }()
 
 	sessionIsLocked := c.utls.sessionController.isSessionLocked()

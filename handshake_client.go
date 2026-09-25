@@ -280,6 +280,9 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	if ech != nil && ech.config != nil {
+		c.echPublicName = string(ech.config.PublicName)
+	}
 
 	session, earlySecret, binderKey, err := c.loadSession(hello)
 	if err != nil {
@@ -1160,7 +1163,13 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 			}
 
 			if len(c.config.InsecureServerNameToVerify) == 0 {
-				opts.DNSName = c.config.ServerName
+				if c.echPublicName != "" {
+					opts.DNSName = c.echPublicName
+				} else if c.serverName != "" {
+					opts.DNSName = c.serverName
+				} else {
+					opts.DNSName = c.config.ServerName
+				}
 			} else if c.config.InsecureServerNameToVerify != "*" {
 				opts.DNSName = c.config.InsecureServerNameToVerify
 			}

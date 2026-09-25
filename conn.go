@@ -71,6 +71,7 @@ type Conn struct {
 	// or sending NewSessionTicket messages.
 	resumptionSecret []byte
 	echAccepted      bool
+	echPublicName    string
 
 	// ticketKeys is the set of active session ticket keys for this
 	// connection. The first one is used to encrypt new tickets and

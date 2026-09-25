@@ -527,14 +527,31 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 		if pskCommon.Session != nil {
 			cipherSuite = cipherSuiteTLS13ByID(pskCommon.Session.cipherSuite)
 			if cipherSuite != nil {
-				inner.pskIdentities = make([]pskIdentity, len(pskCommon.Identities))
-				for i, id := range pskCommon.Identities {
-					inner.pskIdentities[i] = pskIdentity{
-						label:               id.Label,
-						obfuscatedTicketAge: id.ObfuscatedTicketAge,
+				if !useKey {
+					if len(inner.pskIdentities) > 0 {
+						for i := range inner.pskIdentities {
+							if i < len(pskCommon.Identities) {
+								pskCommon.Identities[i].ObfuscatedTicketAge = inner.pskIdentities[i].obfuscatedTicketAge
+							}
+						}
+						inner.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
+					} else {
+						// PSK was discarded on retry (e.g. incompatible cipher suite after HRR)
+						pskCommon = nil
+						cipherSuite = nil
+						inner.pskIdentities = nil
+						inner.pskBinders = nil
 					}
+				} else {
+					inner.pskIdentities = make([]pskIdentity, len(pskCommon.Identities))
+					for i, id := range pskCommon.Identities {
+						inner.pskIdentities[i] = pskIdentity{
+							label:               id.Label,
+							obfuscatedTicketAge: id.ObfuscatedTicketAge,
+						}
+					}
+					inner.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
 				}
-				inner.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
 			}
 		}
 	}
@@ -598,7 +615,15 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 		if err != nil {
 			return fmt.Errorf("marshalWithoutBinders failed: %w", err)
 		}
-		transcript := cipherSuite.hash.New()
+		var transcript hash.Hash
+		if !useKey && ech.innerTranscript != nil {
+			transcript = cloneHash(ech.innerTranscript, cipherSuite.hash)
+			if transcript == nil {
+				return fmt.Errorf("utls: unable to clone inner transcript with hash %v", cipherSuite.hash)
+			}
+		} else {
+			transcript = cipherSuite.hash.New()
+		}
 		transcript.Write(reconBytesWithoutBinders)
 		binder := cipherSuite.finishedHash(pskCommon.BinderKey, transcript)
 		inner.pskBinders = [][]byte{binder}

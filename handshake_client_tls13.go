@@ -14,8 +14,8 @@ import (
 	"crypto/rsa"
 	"crypto/subtle"
 	"errors"
-	"fmt"
 	"hash"
+	"io"
 	"slices"
 	"time"
 
@@ -255,7 +255,8 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 	// The first ClientHello gets double-hashed into the transcript upon a
 	// HelloRetryRequest. (The idea is that the server might offload transcript
 	// storage to the client in the cookie.) See RFC 8446, Section 4.4.1.
-	chHash := hs.transcript.Sum(nil)
+	outerChHash := hs.transcript.Sum(nil)
+	chHash := outerChHash
 	hs.transcript.Reset()
 	hs.transcript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})
 	hs.transcript.Write(chHash)
@@ -294,6 +295,10 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 				isInnerHello = true
 				c.echAccepted = true
 			}
+		}
+
+		if !isInnerHello {
+			chHash = outerChHash
 		}
 
 		if err := transcriptMsg(hs.serverHello, hs.echContext.innerTranscript); err != nil {
@@ -389,9 +394,33 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 	// and utlsExtensionPadding are supposed to change
 	if hs.uconn != nil {
 		if hs.uconn.ClientHelloID.Str() != HelloGolang.Str() {
-			if len(hs.hello.pskIdentities) > 0 {
-				// TODO: wait for someone who cares about PSK to implement
-				return errors.New("uTLS does not support reprocessing of PSK key triggered by HelloRetryRequest")
+			var pskExt *UtlsPreSharedKeyExtension
+			var pskExtIdx int = -1
+			for i, ext := range hs.uconn.Extensions {
+				if p, ok := ext.(*UtlsPreSharedKeyExtension); ok {
+					pskExt = p
+					pskExtIdx = i
+					break
+				}
+			}
+
+			if len(hello.pskIdentities) > 0 && pskExt != nil {
+				if len(pskExt.Identities) > 0 {
+					pskExt.Identities[0].ObfuscatedTicketAge = hello.pskIdentities[0].obfuscatedTicketAge
+				}
+				if len(hs.uconn.HandshakeState.Hello.PskIdentities) > 0 {
+					hs.uconn.HandshakeState.Hello.PskIdentities[0].ObfuscatedTicketAge = hello.pskIdentities[0].obfuscatedTicketAge
+				}
+			} else if len(hello.pskIdentities) == 0 {
+				if pskExtIdx >= 0 {
+					hs.uconn.Extensions = slices.Delete(hs.uconn.Extensions, pskExtIdx, pskExtIdx+1)
+				}
+				hs.uconn.HandshakeState.Hello.PskIdentities = nil
+				hs.uconn.HandshakeState.Hello.PskBinders = nil
+				if hs.uconn.sessionController != nil {
+					hs.uconn.sessionController.pskExtension = nil
+				}
+				pskExt = nil
 			}
 
 			keyShareExtFound := false
@@ -406,6 +435,7 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 				return errors.New("uTLS: received HelloRetryRequest, but keyshare not found among client's " +
 					"uconn.Extensions")
 			}
+			hs.uconn.HandshakeState.Hello.KeyShares = keyShares(hello.keyShares).ToPublic()
 
 			if len(hs.serverHello.cookie) > 0 {
 				// serverHello specified a cookie, let's echo it
@@ -419,17 +449,19 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 
 				if !cookieFound {
 					// pick a random index where to add cookieExtension
-					// -2 instead of -1 is a lazy way to ensure that PSK is still a last extension
+					// PSK must remain the last extension
 					p, err := newPRNG()
 					if err != nil {
 						return err
 					}
-					cookieIndex := p.Intn(len(hs.uconn.Extensions) - 2)
-					if cookieIndex >= len(hs.uconn.Extensions) {
-						// this check is for empty hs.uconn.Extensions
-						return fmt.Errorf("cookieIndex >= len(hs.uconn.Extensions): %v >= %v",
-							cookieIndex, len(hs.uconn.Extensions))
+					maxIdx := len(hs.uconn.Extensions)
+					if pskExt != nil {
+						maxIdx = len(hs.uconn.Extensions) - 1
 					}
+					if maxIdx <= 0 {
+						maxIdx = 1
+					}
+					cookieIndex := p.Intn(maxIdx)
 					hs.uconn.Extensions = append(hs.uconn.Extensions[:cookieIndex],
 						append([]TLSExtension{&CookieExtension{Cookie: hs.serverHello.cookie}},
 							hs.uconn.Extensions[cookieIndex:]...)...)
@@ -439,6 +471,23 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 				return err
 			}
 			hs.hello.original = hs.uconn.HandshakeState.Hello.Raw
+
+			if len(hello.pskIdentities) > 0 && pskExt != nil {
+				transcript := hs.suite.hash.New()
+				transcript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})
+				transcript.Write(chHash)
+				if err := transcriptMsg(hs.serverHello, transcript); err != nil {
+					return err
+				}
+				if err := pskExt.PatchBuiltHelloWithTranscript(hs.uconn.HandshakeState.Hello, transcript); err != nil && err != io.EOF {
+					return err
+				}
+				hs.uconn.HandshakeState.Hello.PskBinders = pskExt.Binders
+				hello.pskBinders = pskExt.Binders
+				hs.hello.pskBinders = pskExt.Binders
+				hs.hello.original = hs.uconn.HandshakeState.Hello.Raw
+				hello.original = hs.uconn.HandshakeState.Hello.Raw
+			}
 		}
 	}
 	// [uTLS SECTION ENDS]

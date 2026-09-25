@@ -3,6 +3,7 @@ package tls
 import (
 	"encoding/json"
 	"errors"
+	"hash"
 	"io"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -88,6 +89,10 @@ type PreSharedKeyExtension interface {
 	// Its purpose is to update the binders of PSK (Pre-Shared Key) identities.
 	PatchBuiltHello(hello *PubClientHelloMsg) error
 
+	// PatchBuiltHelloWithTranscript updates the binders using an optional transcript hash.
+	// If transcript is nil, a fresh transcript from helloBytes is used.
+	PatchBuiltHelloWithTranscript(hello *PubClientHelloMsg, transcript hash.Hash) error
+
 	mustEmbedUnimplementedPreSharedKeyExtension() // this works like a type guard
 }
 
@@ -121,6 +126,10 @@ func (*UnimplementedPreSharedKeyExtension) GetPreSharedKeyCommon() PreSharedKeyC
 
 func (*UnimplementedPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) error {
 	panic("tls: ReadWithRawHello is not implemented for the PreSharedKeyExtension")
+}
+
+func (*UnimplementedPreSharedKeyExtension) PatchBuiltHelloWithTranscript(hello *PubClientHelloMsg, transcript hash.Hash) error {
+	panic("tls: PatchBuiltHelloWithTranscript is not implemented for the PreSharedKeyExtension")
 }
 
 func (*UnimplementedPreSharedKeyExtension) SetOmitEmptyPsk(val bool) {
@@ -262,6 +271,10 @@ func (e *UtlsPreSharedKeyExtension) Read(b []byte) (int, error) {
 }
 
 func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) error {
+	return e.PatchBuiltHelloWithTranscript(hello, nil)
+}
+
+func (e *UtlsPreSharedKeyExtension) PatchBuiltHelloWithTranscript(hello *PubClientHelloMsg, transcript hash.Hash) error {
 	if e.Len() == 0 {
 		return nil
 	}
@@ -273,7 +286,9 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 	private.pskBinders = e.Binders // set the placeholder to the private Hello
 
 	//--- mirror loadSession() begin ---//
-	transcript := e.cipherSuite.hash.New()
+	if transcript == nil {
+		transcript = e.cipherSuite.hash.New()
+	}
 	helloBytes, err := private.marshalWithoutBinders() // no marshal() will be actually called, as we have set the field `raw`
 	if err != nil {
 		return err
@@ -295,16 +310,19 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 			})
 		}
 	})
-	if out, err := b.Bytes(); err != nil || len(out) != len(private.original) {
+	out, err := b.Bytes()
+	if err != nil || len(out) != len(private.original) {
 		return errors.New("tls: internal error: failed to update binders")
 	}
+	hello.Raw = out
+	private.original = out
 
 	//--- mirror loadSession() end ---//
 	e.Binders = pskBinders
 
 	// no need to care about other PSK related fields, they will be handled separately
 
-	return io.EOF
+	return nil
 }
 
 func (e *UtlsPreSharedKeyExtension) Write(b []byte) (int, error) {
@@ -386,6 +404,10 @@ var validHashLen = mapSlice(cipherSuitesTLS13, func(c *cipherSuiteTLS13) int {
 
 func (*FakePreSharedKeyExtension) PatchBuiltHello(*PubClientHelloMsg) error {
 	return nil // no need to patch the hello since we don't need to update binders
+}
+
+func (*FakePreSharedKeyExtension) PatchBuiltHelloWithTranscript(*PubClientHelloMsg, hash.Hash) error {
+	return nil
 }
 
 func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
